@@ -1,0 +1,43 @@
+{
+  "server_url": "https://backend.paraqlab.kz/tracker-api/api/communication/jobs",
+  "api_token": "",
+  "camera_label_keywords": [
+    "Camera1",
+    "Camera"
+  ],
+  "camera_folder_names": [
+    "100VOICE",
+    "DCIM",
+    "AUDIO",
+    "Audio",
+    "audio",
+    "RECORDINGS",
+    "Recordings"
+  ],
+  "audio_extensions": [
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".aac",
+    ".ogg",
+    ".wma"
+  ],
+  "scan_interval_seconds": 5,
+  "auto_start_upload": true,
+  "delete_from_camera_after_upload": true,
+  "retain_local_archive_days": 7,
+  "verify_ssl": true,
+  "device_poll_enabled": true,
+  "employee_mode": "computer_name",
+  "employee_name": "",
+  "store_name": "Store01",
+  "camera_id_from_drive_label": true,
+  "max_parallel_uploads": 1,
+  "request_timeout_seconds": 60,
+  "server_metadata_headers": {
+    "accept": "application/json"
+  },
+  "microphone_device_name": "Camera1",
+  "language_hint": "ru",
+  "output_language": "ru"
+}
