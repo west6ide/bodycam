@@ -33,7 +33,6 @@
   "store_name": "Store01",
   "camera_id_from_drive_label": true,
   "max_parallel_uploads": 1,
-  "request_timeout_seconds": 60,
   "server_metadata_headers": {
     "accept": "application/json"
   },

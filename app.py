@@ -48,7 +48,6 @@ DEFAULT_CONFIG = {
     'store_name': 'Store01',
     'camera_id_from_drive_label': True,
     'max_parallel_uploads': 1,
-    'request_timeout_seconds': 60,
     'microphone_device_name': 'Camera1',
     'language_hint': 'ru',
     'output_language': 'ru',
@@ -180,6 +179,8 @@ class Uploader:
         self.ui_callback = ui_callback
         self.active = False
         self.cancel_requested = False
+        self.session_uploaded_shas: set[str] = set()
+        self.session_device_key = ''
 
     def _emit(self, event: str, data: Dict):
         self.ui_callback(event, data)
@@ -194,6 +195,16 @@ class Uploader:
     def _build_storage_name(self, camera_file: CameraFile) -> str:
         original_name = Path(camera_file.rel_path).name
         return f'{camera_file.sha256[:12]}_{original_name}'
+
+    def start_device_session(self, device: CameraDevice):
+        device_key = f'{device.mountpoint}|{device.camera_id}'
+        if self.session_device_key != device_key:
+            self.session_device_key = device_key
+            self.session_uploaded_shas.clear()
+
+    def end_device_session(self):
+        self.session_device_key = ''
+        self.session_uploaded_shas.clear()
 
     def _resolve_microphone_device_name(self, device: CameraDevice) -> str:
         return self.config.get('microphone_device_name') or device.label or device.camera_id
@@ -281,6 +292,7 @@ class Uploader:
             return
         self.active = True
         self.cancel_requested = False
+        self.start_device_session(device)
         try:
             files = self.scan_files(device)
             self._emit('files_found', {
@@ -301,7 +313,7 @@ class Uploader:
 
                 self._emit('progress', {'phase': 'hash', 'index': idx, 'total': len(files), 'file': f.rel_path, 'percent': 0})
                 f.sha256 = self.hash_file(f.src_path)
-                if self.db.is_uploaded(f.sha256):
+                if f.sha256 in self.session_uploaded_shas:
                     self._emit('progress', {'phase': 'skip', 'index': idx, 'total': len(files), 'file': f.rel_path, 'percent': int((idx / len(files)) * 100)})
                     continue
 
@@ -313,6 +325,7 @@ class Uploader:
                 self._copy_with_progress(f, staging_path, idx, len(files))
                 remote_id = self._upload_with_progress(f, device, idx, len(files))
                 self.db.mark_uploaded(f.sha256, str(f.src_path), device.camera_id, remote_id)
+                self.session_uploaded_shas.add(f.sha256)
                 self._archive_staged_file(f, device)
                 if self.config.get('delete_from_camera_after_upload', True):
                     try:
@@ -359,7 +372,6 @@ class Uploader:
             raise RuntimeError('staging_path missing')
         url = self.config['server_url']
         token = self.config.get('api_token', '')
-        timeout = self.config.get('request_timeout_seconds', 60)
         verify_ssl = self.config.get('verify_ssl', True)
 
         headers = {'Authorization': f'Bearer {token}'} if token else {}
@@ -374,7 +386,7 @@ class Uploader:
                 'language_hint': self.config.get('language_hint', 'ru'),
                 'output_language': self.config.get('output_language', 'ru'),
             }
-            response = requests.post(url, headers=headers, files=files, data=data, timeout=timeout, verify=verify_ssl)
+            response = requests.post(url, headers=headers, files=files, data=data, verify=verify_ssl)
         response.raise_for_status()
         try:
             payload = response.json()
@@ -556,6 +568,8 @@ class App:
         device = self.uploader.discover_camera()
         if device:
             changed = not self.current_device or self.current_device.mountpoint != device.mountpoint
+            if changed:
+                self.uploader.start_device_session(device)
             self.current_device = device
             if self.window_hidden:
                 self._show_window_for_camera()
@@ -573,6 +587,7 @@ class App:
         else:
             if self.current_device is not None:
                 self.log('Камера отключена.')
+                self.uploader.end_device_session()
             self.current_device = None
             self.camera_var.set('Камера: не подключена')
             self.status_var.set('Ожидание подключения камеры...')
