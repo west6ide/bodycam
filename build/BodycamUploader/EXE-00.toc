@@ -62,7 +62,7 @@
  [],
  False,
  False,
- 1773779145,
+ 1773919950,
  [('runw.exe',
    'C:\\Users\\skydy\\bodycam_windows_agent\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

@@ -6,8 +6,10 @@ import queue
 import atexit
 import shutil
 import sqlite3
+import struct
 import threading
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -196,6 +198,116 @@ class Uploader:
         original_name = Path(camera_file.rel_path).name
         return f'{camera_file.sha256[:12]}_{original_name}'
 
+    def _build_archive_name(self, device: CameraDevice) -> str:
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        return f'{device.camera_id}_{timestamp}.zip'
+
+    def _format_bytes(self, size: int) -> str:
+        units = ['B', 'KB', 'MB', 'GB', 'TB']
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                return f'{value:.1f} {unit}'
+            value /= 1024
+        return f'{size} B'
+
+    def _wav_format_name(self, format_code: int) -> str:
+        known = {
+            0x0001: 'PCM',
+            0x0002: 'ADPCM',
+            0x0003: 'IEEE_FLOAT',
+            0x0006: 'ALAW',
+            0x0007: 'MULAW',
+            0x0011: 'IMA_ADPCM',
+            0x0031: 'GSM610',
+            0x0050: 'MPEG',
+            0x0055: 'MP3',
+            0x00FF: 'AAC',
+        }
+        return known.get(format_code, f'format_0x{format_code:04X}')
+
+    def _probe_wav_format(self, path: Path) -> Optional[Dict[str, int]]:
+        try:
+            with open(path, 'rb') as f:
+                header = f.read(65536)
+        except OSError:
+            return None
+
+        if len(header) < 12 or header[:4] != b'RIFF' or header[8:12] != b'WAVE':
+            return None
+
+        offset = 12
+        while offset + 8 <= len(header):
+            chunk_id = header[offset:offset + 4]
+            chunk_size = struct.unpack_from('<I', header, offset + 4)[0]
+            chunk_data_offset = offset + 8
+            if chunk_id == b'fmt ' and chunk_size >= 16 and chunk_data_offset + chunk_size <= len(header):
+                format_code, channels, sample_rate = struct.unpack_from('<HHI', header, chunk_data_offset)
+                bits_per_sample = struct.unpack_from('<H', header, chunk_data_offset + 14)[0]
+                return {
+                    'format_code': format_code,
+                    'channels': channels,
+                    'sample_rate': sample_rate,
+                    'bits_per_sample': bits_per_sample,
+                }
+            offset = chunk_data_offset + chunk_size + (chunk_size % 2)
+        return None
+
+    def _build_wav_codec_summary(self, files: List[CameraFile]) -> Optional[str]:
+        wav_files = [camera_file for camera_file in files if camera_file.src_path.suffix.lower() == '.wav']
+        if not wav_files:
+            return None
+
+        codec_counts: Dict[str, int] = {}
+        sample_details: List[str] = []
+        unknown_count = 0
+        for camera_file in wav_files[:10]:
+            info = self._probe_wav_format(camera_file.src_path)
+            if not info:
+                unknown_count += 1
+                continue
+            codec_name = self._wav_format_name(info['format_code'])
+            codec_counts[codec_name] = codec_counts.get(codec_name, 0) + 1
+            if len(sample_details) < 3:
+                sample_details.append(
+                    f"{Path(camera_file.rel_path).name}: {codec_name}, "
+                    f"{info['channels']}ch, {info['sample_rate']}Hz, {info['bits_per_sample']}bit"
+                )
+
+        parts = [f'WAV files: {len(wav_files)}']
+        if codec_counts:
+            codecs_text = ', '.join(f'{name}={count}' for name, count in sorted(codec_counts.items()))
+            parts.append(f'codecs: {codecs_text}')
+        if unknown_count:
+            parts.append(f'unparsed={unknown_count}')
+        if sample_details:
+            parts.append('samples: ' + '; '.join(sample_details))
+        return ' | '.join(parts)
+
+    def _log_zip_diagnostics(self, files: List[CameraFile], zip_path: Path):
+        total_size = sum(f.size for f in files)
+        try:
+            zip_size = zip_path.stat().st_size
+        except OSError:
+            logging.warning('ZIP created but size could not be read: %s', zip_path)
+            return
+
+        saved_bytes = total_size - zip_size
+        ratio = (zip_size / total_size * 100) if total_size else 0.0
+        saved_ratio = (saved_bytes / total_size * 100) if total_size else 0.0
+        summary = (
+            f"ZIP diagnostics: source={self._format_bytes(total_size)} ({total_size} bytes), "
+            f"zip={self._format_bytes(zip_size)} ({zip_size} bytes), "
+            f"ratio={ratio:.1f}%, saved={self._format_bytes(saved_bytes)} ({saved_ratio:.1f}%)"
+        )
+        logging.info(summary)
+        self._emit('log', {'message': summary})
+
+        wav_summary = self._build_wav_codec_summary(files)
+        if wav_summary:
+            logging.info(wav_summary)
+            self._emit('log', {'message': wav_summary})
+
     def start_device_session(self, device: CameraDevice):
         device_key = f'{device.mountpoint}|{device.camera_id}'
         if self.session_device_key != device_key:
@@ -305,28 +417,20 @@ class Uploader:
                 self._emit('status', {'message': 'Аудиофайлы не найдены.'})
                 return
 
-            uploaded_count = 0
+            pending_files: List[CameraFile] = []
             for idx, f in enumerate(files, start=1):
                 if self.cancel_requested:
                     self._emit('status', {'message': 'Операция отменена.'})
                     break
 
-                self._emit('progress', {'phase': 'hash', 'index': idx, 'total': len(files), 'file': f.rel_path, 'percent': 0})
+                self._emit('progress', {'phase': 'hash', 'index': idx, 'total': len(files), 'file': f.rel_path, 'size': f.size, 'percent': 0})
                 f.sha256 = self.hash_file(f.src_path)
                 if f.sha256 in self.session_uploaded_shas:
-                    self._emit('progress', {'phase': 'skip', 'index': idx, 'total': len(files), 'file': f.rel_path, 'percent': int((idx / len(files)) * 100)})
+                    self._emit('progress', {'phase': 'skip', 'index': idx, 'total': len(files), 'file': f.rel_path, 'size': f.size, 'percent': int((idx / len(files)) * 100)})
                     continue
 
-                staging_dir = STAGING_DIR / device.camera_id / datetime.now().strftime('%Y-%m-%d')
-                staging_dir.mkdir(parents=True, exist_ok=True)
-                staging_path = staging_dir / self._build_storage_name(f)
-                f.staging_path = staging_path
-
-                self._copy_with_progress(f, staging_path, idx, len(files))
-                remote_id = self._upload_with_progress(f, device, idx, len(files))
-                self.db.mark_uploaded(f.sha256, str(f.src_path), device.camera_id, remote_id)
-                self.session_uploaded_shas.add(f.sha256)
-                self._archive_staged_file(f, device)
+                pending_files.append(f)
+                continue
                 if self.config.get('delete_from_camera_after_upload', True):
                     try:
                         f.src_path.unlink()
@@ -334,42 +438,63 @@ class Uploader:
                         logging.exception('Failed deleting from camera: %s', e)
                         self._emit('warning', {'message': f'Не удалось удалить файл с камеры: {f.rel_path}'})
                 uploaded_count += 1
-                self._emit('progress', {'phase': 'done_file', 'index': idx, 'total': len(files), 'file': f.rel_path, 'percent': int((idx / len(files)) * 100)})
+                self._emit('progress', {'phase': 'done_file', 'index': idx, 'total': len(files), 'file': f.rel_path, 'size': f.size, 'percent': int((idx / len(files)) * 100)})
+
+            if self.cancel_requested:
+                return
+
+            if not pending_files:
+                self._emit('status', {'message': 'РќРѕРІС‹С… С„Р°Р№Р»РѕРІ РґР»СЏ РІС‹РіСЂСѓР·РєРё РЅРµС‚.'})
+                return
+
+            staging_dir = STAGING_DIR / device.camera_id / datetime.now().strftime('%Y-%m-%d')
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            zip_path = staging_dir / self._build_archive_name(device)
+
+            self._create_zip_with_progress(pending_files, zip_path)
+            remote_id = self._upload_archive_with_progress(zip_path, device, pending_files)
+            self._archive_zip_file(zip_path, device)
+
+            for idx, f in enumerate(pending_files, start=1):
+                self.db.mark_uploaded(f.sha256, str(f.src_path), device.camera_id, remote_id)
+                self.session_uploaded_shas.add(f.sha256)
+                if self.config.get('delete_from_camera_after_upload', True):
+                    try:
+                        f.src_path.unlink()
+                    except Exception as e:
+                        logging.exception('Failed deleting from camera: %s', e)
+                        self._emit('warning', {'message': f'РќРµ СѓРґР°Р»РѕСЃСЊ СѓРґР°Р»РёС‚СЊ С„Р°Р№Р» СЃ РєР°РјРµСЂС‹: {f.rel_path}'})
+                self._emit('progress', {'phase': 'done_file', 'index': idx, 'total': len(pending_files), 'file': f.rel_path, 'size': f.size, 'percent': int((idx / len(pending_files)) * 100)})
 
             self._cleanup_old_archive()
-            self._emit('completed', {'uploaded_count': uploaded_count, 'camera_id': device.camera_id})
+            self._emit('completed', {'uploaded_count': len(pending_files), 'camera_id': device.camera_id})
         except Exception as e:
             logging.exception('Upload failed: %s', e)
             self._emit('error', {'message': str(e)})
         finally:
             self.active = False
 
-    def _copy_with_progress(self, camera_file: CameraFile, staging_path: Path, idx: int, total: int):
-        chunk_size = 1024 * 1024
-        copied = 0
-        with open(camera_file.src_path, 'rb') as src, open(staging_path, 'wb') as dst:
-            while True:
-                chunk = src.read(chunk_size)
-                if not chunk:
-                    break
-                dst.write(chunk)
-                copied += len(chunk)
-                overall = ((idx - 1) / total) * 100
-                file_pct = copied / max(camera_file.size, 1)
-                percent = min(99, int(overall + (file_pct * (100 / total))))
+    def _create_zip_with_progress(self, files: List[CameraFile], zip_path: Path):
+        total_size = sum(f.size for f in files)
+        processed_size = 0
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
+            for idx, camera_file in enumerate(files, start=1):
+                archive.write(camera_file.src_path, arcname=camera_file.rel_path)
+                processed_size += camera_file.size
+                percent = min(99, int((processed_size / max(total_size, 1)) * 100))
                 self._emit('progress', {
-                    'phase': 'copy',
+                    'phase': 'zip',
                     'index': idx,
-                    'total': total,
+                    'total': len(files),
                     'file': camera_file.rel_path,
-                    'bytes_done': copied,
-                    'bytes_total': camera_file.size,
+                    'size': camera_file.size,
+                    'bytes_done': processed_size,
+                    'bytes_total': total_size,
                     'percent': percent,
                 })
+        self._log_zip_diagnostics(files, zip_path)
 
-    def _upload_with_progress(self, camera_file: CameraFile, device: CameraDevice, idx: int, total: int) -> str:
-        if camera_file.staging_path is None:
-            raise RuntimeError('staging_path missing')
+    def _upload_archive_with_progress(self, zip_path: Path, device: CameraDevice, files: List[CameraFile]) -> str:
         url = self.config['server_url']
         token = self.config.get('api_token', '')
         verify_ssl = self.config.get('verify_ssl', True)
@@ -377,23 +502,26 @@ class Uploader:
         headers = {'Authorization': f'Bearer {token}'} if token else {}
         headers.update(self.config.get('server_metadata_headers', {}))
 
-        self._emit('progress', {'phase': 'upload', 'index': idx, 'total': total, 'file': camera_file.rel_path, 'percent': int(((idx - 1) / total) * 100)})
-        with open(camera_file.staging_path, 'rb') as f:
-            files = {'audio_file': (Path(camera_file.rel_path).name, f, 'application/octet-stream')}
+        self._emit('progress', {'phase': 'upload', 'index': 1, 'total': 1, 'file': zip_path.name, 'size': zip_path.stat().st_size, 'percent': 99})
+        with open(zip_path, 'rb') as f:
+            multipart_files = {'audio_file': (zip_path.name, f, 'application/zip')}
             data = {
                 'microphone_device_name': self._resolve_microphone_device_name(device),
-                'report_date': self._resolve_report_date(camera_file),
+                'report_date': self._resolve_report_date(files[0]),
                 'language_hint': self.config.get('language_hint', 'ru'),
                 'output_language': self.config.get('output_language', 'ru'),
+                'camera_id': device.camera_id,
+                'file_count': str(len(files)),
+                'file_names': json.dumps([camera_file.rel_path for camera_file in files], ensure_ascii=False),
             }
-            response = requests.post(url, headers=headers, files=files, data=data, verify=verify_ssl)
+            response = requests.post(url, headers=headers, files=multipart_files, data=data, verify=verify_ssl)
         response.raise_for_status()
         try:
             payload = response.json()
         except ValueError:
             return ''
         if payload.get('ok') is False or payload.get('success') is False:
-            raise RuntimeError(payload.get('error') or payload.get('message') or 'Server rejected the audio file')
+            raise RuntimeError(payload.get('error') or payload.get('message') or 'Server rejected the archive')
         return str(payload.get('remote_id') or payload.get('id') or payload.get('job_id') or '')
 
     def _resolve_employee_name(self) -> str:
@@ -402,12 +530,10 @@ class Uploader:
             return self.config['employee_name']
         return os.environ.get('USERNAME') or os.environ.get('COMPUTERNAME') or 'unknown'
 
-    def _archive_staged_file(self, camera_file: CameraFile, device: CameraDevice):
-        if camera_file.staging_path is None:
-            return
+    def _archive_zip_file(self, zip_path: Path, device: CameraDevice):
         archive_dir = ARCHIVE_DIR / device.camera_id / datetime.now().strftime('%Y-%m-%d')
         archive_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(camera_file.staging_path), archive_dir / camera_file.staging_path.name)
+        shutil.move(str(zip_path), archive_dir / zip_path.name)
 
     def _cleanup_old_archive(self):
         keep_days = int(self.config.get('retain_local_archive_days', 7))
@@ -515,6 +641,7 @@ class App:
             phase_map = {
                 'hash': 'Проверка файла',
                 'copy': 'Копирование на ноутбук',
+                'zip': 'Упаковка ZIP',
                 'upload': 'Отправка на сервер',
                 'done_file': 'Файл обработан',
                 'skip': 'Файл уже был выгружен'
@@ -522,7 +649,7 @@ class App:
             phase_text = phase_map.get(data.get('phase', ''), data.get('phase', ''))
             self.progress_label.set(f"{phase_text}: {pct}%")
             self.status_var.set(f"{phase_text}: {data.get('file', '')}")
-            self._upsert_tree(data.get('file', ''), data.get('bytes_total', None), phase_text)
+            self._upsert_tree(data.get('file', ''), data.get('size', data.get('bytes_total', None)), phase_text)
         elif event == 'completed':
             self.progress['value'] = 100
             self.progress_label.set('Прогресс: 100%')
@@ -531,6 +658,8 @@ class App:
             messagebox.showinfo(APP_NAME, 'Все файлы успешно выгружены. Камеру можно отключить.')
         elif event == 'status':
             self.status_var.set(data['message'])
+            self.log(data['message'])
+        elif event == 'log':
             self.log(data['message'])
         elif event == 'warning':
             self.log('Предупреждение: ' + data['message'])
